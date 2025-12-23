@@ -48,15 +48,21 @@ channels = 128
 projection_channels = 128
 n_highways = 4
 highway_size = 128
-rnn_size = 128
+rnn_size = 128       # output will be 2 * rnn_size (like bidirectional GRU)
+n_heads = 4          # self-attention heads (replaces bidirectional GRU)
+n_layers = 2         # number of self-attention layers
+dropout = 0.1
 
 [model.decoder]
 input_size = 128  # should match model.encoder.cbhg.channels
 n_mels = 80  # should match preprocess.n_mels
-attn_rnn_size = 256
+attn_rnn_size = 256   # now used as decoder hidden size
 decoder_rnn_size = 256
 reduction_factor = 2
-zoneout_prob = 0.1
+zoneout_prob = 0.1    # kept for compatibility, dropout used instead
+n_layers = 3          # number of self-attention layers (replaces LSTMs)
+n_heads = 4           # self-attention heads
+dropout = 0.1
 
 [model.decoder.prenet]
 input_size = 80  # should match preprocess.n_mels
