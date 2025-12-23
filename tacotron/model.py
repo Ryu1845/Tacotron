@@ -1,10 +1,10 @@
 import importlib_resources
-import numpy as np
+import math
+
 import toml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.stats import betabinom
 
 
 class Tacotron(nn.Module):
@@ -15,6 +15,7 @@ class Tacotron(nn.Module):
         self.decoder_rnn_size = decoder["decoder_rnn_size"]
         self.n_mels = decoder["n_mels"]
         self.reduction_factor = decoder["reduction_factor"]
+        self.n_kernels = decoder["attention"]["n_kernels"]
 
         self.encoder = Encoder(**encoder)
         self.decoder_cell = DecoderCell(**decoder)
@@ -51,9 +52,8 @@ class Tacotron(nn.Module):
 
         h = self.encoder(x)
 
-        alpha = F.one_hot(
-            torch.zeros(B, dtype=torch.long, device=x.device), h.size(1)
-        ).float()
+        # Initialize mu (GMM mean positions) to zeros
+        mu = torch.zeros(B, self.n_kernels, 1, device=x.device)
         c = torch.zeros(B, self.input_size, device=x.device)
 
         attn_hx = (
@@ -76,8 +76,8 @@ class Tacotron(nn.Module):
         ys, alphas = [], []
         for t in range(0, T, self.reduction_factor):
             y = mels[t - 1] if t > 0 else go_frame
-            y, alpha, c, attn_hx, rnn1_hx, rnn2_hx = self.decoder_cell(
-                h, y, alpha, c, attn_hx, rnn1_hx, rnn2_hx
+            y, alpha, mu, c, attn_hx, rnn1_hx, rnn2_hx = self.decoder_cell(
+                h, y, mu, c, attn_hx, rnn1_hx, rnn2_hx
             )
             ys.append(y)
             alphas.append(alpha)
@@ -104,7 +104,8 @@ class Tacotron(nn.Module):
         h = self.encoder(x)
         B, T, _ = h.size()
 
-        alpha = F.one_hot(torch.zeros(B, dtype=torch.long, device=x.device), T).float()
+        # Initialize mu (GMM mean positions) to zeros
+        mu = torch.zeros(B, self.n_kernels, 1, device=x.device)
         c = torch.zeros(B, self.input_size, device=x.device)
 
         attn_hx = (
@@ -127,8 +128,8 @@ class Tacotron(nn.Module):
         ys, alphas = [], []
         for t in range(0, max_length, self.reduction_factor):
             y = ys[-1][:, :, -1] if t > 0 else go_frame
-            y, alpha, c, attn_hx, rnn1_hx, rnn2_hx = self.decoder_cell(
-                h, y, alpha, c, attn_hx, rnn1_hx, rnn2_hx
+            y, alpha, mu, c, attn_hx, rnn1_hx, rnn2_hx = self.decoder_cell(
+                h, y, mu, c, attn_hx, rnn1_hx, rnn2_hx
             )
             if torch.all(y[:, :, -1] > stop_threshold):
                 break
@@ -140,63 +141,88 @@ class Tacotron(nn.Module):
         return ys, alphas
 
 
-class DynamicConvolutionAttention(nn.Module):
+class GMMv2Attention(nn.Module):
+    """
+    GMMv2 (Gaussian Mixture Model v2) attention mechanism from
+    "Location-Relative Attention Mechanisms For Robust Long-Form Speech Synthesis"
+    (https://arxiv.org/abs/1910.10288)
+
+    Uses a mixture of Gaussians to model attention, with the mean position
+    updated incrementally at each step. This is a location-relative mechanism
+    that generalizes well to long-form synthesis.
+    """
+
     def __init__(
         self,
         attn_rnn_size,
         hidden_size,
-        static_channels,
-        static_kernel_size,
-        dynamic_channels,
-        dynamic_kernel_size,
-        prior_length,
-        alpha,
-        beta,
+        n_kernels,
+        delta_bias,
+        sigma_bias,
     ):
-        super(DynamicConvolutionAttention, self).__init__()
+        super(GMMv2Attention, self).__init__()
+        self.n_kernels = n_kernels
 
-        self.prior_length = prior_length
-        self.dynamic_channels = dynamic_channels
-        self.dynamic_kernel_size = dynamic_kernel_size
+        self.query_layer = nn.Linear(attn_rnn_size, hidden_size, bias=True)
+        self.v = nn.Linear(hidden_size, 3 * n_kernels, bias=True)
 
-        P = betabinom.pmf(np.arange(prior_length), prior_length - 1, alpha, beta)
-
-        self.register_buffer("P", torch.FloatTensor(P).flip(0))
-        self.W = nn.Linear(attn_rnn_size, hidden_size)
-        self.V = nn.Linear(
-            hidden_size, dynamic_channels * dynamic_kernel_size, bias=False
+        # Initialize biases for delta and sigma to encourage fast alignment
+        nn.init.constant_(
+            self.v.bias[n_kernels : 2 * n_kernels], delta_bias
         )
-        self.F = nn.Conv1d(
-            1,
-            static_channels,
-            static_kernel_size,
-            padding=(static_kernel_size - 1) // 2,
-            bias=False,
+        nn.init.constant_(
+            self.v.bias[2 * n_kernels : 3 * n_kernels], sigma_bias
         )
-        self.U = nn.Linear(static_channels, hidden_size, bias=False)
-        self.T = nn.Linear(dynamic_channels, hidden_size)
-        self.v = nn.Linear(hidden_size, 1, bias=False)
 
-    def forward(self, s, alpha):
-        p = F.conv1d(
-            F.pad(alpha.unsqueeze(1), (self.prior_length - 1, 0)), self.P.view(1, 1, -1)
-        )
-        p = torch.log(p.clamp_min_(1e-6)).squeeze(1)
+    def forward(self, query, prev_mu, memory_length, mask=None):
+        """
+        Args:
+            query: decoder hidden state [B, attn_rnn_size]
+            prev_mu: previous mean positions [B, n_kernels, 1]
+            memory_length: length of encoder sequence (int)
+            mask: optional mask for padded positions [B, T]
 
-        G = self.V(torch.tanh(self.W(s)))
-        g = F.conv1d(
-            alpha.unsqueeze(0),
-            G.view(-1, 1, self.dynamic_kernel_size),
-            padding=(self.dynamic_kernel_size - 1) // 2,
-            groups=s.size(0),
-        )
-        g = g.view(s.size(0), self.dynamic_channels, -1).transpose(1, 2)
+        Returns:
+            alignments: attention weights [B, T]
+            current_mu: updated mean positions [B, n_kernels, 1]
+        """
+        B = query.size(0)
+        device = query.device
 
-        f = self.F(alpha.unsqueeze(1)).transpose(1, 2)
+        # Compute mixture parameters from query
+        processed_query = self.v(torch.tanh(self.query_layer(query)))
+        w_hat, delta_hat, sigma_hat = torch.chunk(processed_query, 3, dim=1)
 
-        e = self.v(torch.tanh(self.U(f) + self.T(g))).squeeze(-1) + p
+        # Mixture weights (softmax over kernels)
+        w = torch.softmax(w_hat, dim=1).unsqueeze(2)  # [B, n_kernels, 1]
 
-        return F.softmax(e, dim=-1)
+        # Step size (softplus for positivity) + small epsilon for stability
+        delta = F.softplus(delta_hat).unsqueeze(2) + 1e-6  # [B, n_kernels, 1]
+
+        # Standard deviation (softplus for positivity)
+        sigma = F.softplus(sigma_hat).unsqueeze(2) + 1e-6  # [B, n_kernels, 1]
+
+        # Update mean position
+        current_mu = prev_mu + delta  # [B, n_kernels, 1]
+
+        # Create time indices [1, 1, T]
+        t = torch.arange(1, memory_length + 1, device=device).float()
+        t = t.view(1, 1, -1)
+
+        # Compute log energies using Gaussian pdf (in log domain for stability)
+        # log(w * N(t; mu, sigma)) = log(w) + log(N(t; mu, sigma))
+        z = math.sqrt(2 * math.pi) * sigma
+        log_energies = -torch.log(z) - 0.5 * (t - current_mu) ** 2 / (sigma ** 2)
+
+        # Apply mask if provided
+        if mask is not None:
+            log_energies = log_energies.masked_fill(mask.unsqueeze(1), -1e10)
+
+        # Weighted sum of Gaussians
+        energies = w * F.softmax(log_energies, dim=-1)  # [B, n_kernels, T]
+        alignments = torch.sum(energies, dim=1)  # [B, T]
+
+        return alignments, current_mu
 
 
 class PreNet(nn.Module):
@@ -352,9 +378,10 @@ class DecoderCell(nn.Module):
     ):
         super(DecoderCell, self).__init__()
         self.zoneout_prob = zoneout_prob
+        self.n_kernels = attention["n_kernels"]
 
         self.prenet = PreNet(**prenet)
-        self.dca = DynamicConvolutionAttention(**attention)
+        self.attention = GMMv2Attention(**attention)
         self.attn_rnn = nn.LSTMCell(
             2 * input_size + prenet["output_size"], attn_rnn_size
         )
@@ -363,15 +390,16 @@ class DecoderCell(nn.Module):
         self.rnn2 = nn.LSTMCell(decoder_rnn_size, decoder_rnn_size)
         self.proj = nn.Linear(decoder_rnn_size, n_mels * reduction_factor, bias=False)
 
-    def forward(self, h, y, alpha, c, attn_hx, rnn1_hx, rnn2_hx):
+    def forward(self, h, y, mu, c, attn_hx, rnn1_hx, rnn2_hx):
         B, N = y.size()
+        T = h.size(1)
 
         y = self.prenet(y)
         attn_h, attn_c = self.attn_rnn(torch.cat((c, y), dim=-1), attn_hx)
         if self.training:
             attn_h = zoneout(attn_hx[0], attn_h, p=self.zoneout_prob)
 
-        alpha = self.dca(attn_h, alpha)
+        alpha, mu = self.attention(attn_h, mu, T)
 
         c = torch.matmul(alpha.unsqueeze(1), h).squeeze(1)
 
@@ -388,4 +416,4 @@ class DecoderCell(nn.Module):
         x = x + rnn2_h
 
         y = self.proj(x).view(B, N, 2)
-        return y, alpha, c, (attn_h, attn_c), (rnn1_h, rnn1_c), (rnn2_h, rnn2_c)
+        return y, alpha, mu, c, (attn_h, attn_c), (rnn1_h, rnn1_c), (rnn2_h, rnn2_c)

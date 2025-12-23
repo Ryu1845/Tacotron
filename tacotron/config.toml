@@ -67,10 +67,6 @@ dropout = 0.5
 [model.decoder.attention]
 attn_rnn_size = 256  # should match model.decoder.attn_rnn_size
 hidden_size = 128
-static_channels = 8
-static_kernel_size = 21
-dynamic_channels = 8
-dynamic_kernel_size = 21
-prior_length = 11
-alpha = 0.1
-beta = 0.9
+n_kernels = 5        # number of Gaussian mixture components
+delta_bias = 1.0     # bias for step size (encourages forward movement)
+sigma_bias = 1.0     # bias for std dev (controls spread of Gaussians)
